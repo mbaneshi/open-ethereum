@@ -45,6 +45,8 @@ const PACKET_PING: u8 = 1;
 const PACKET_PONG: u8 = 2;
 const PACKET_FIND_NODE: u8 = 3;
 const PACKET_NEIGHBOURS: u8 = 4;
+const PACKET_ENR_REQUEST: u8 = 5;
+const PACKET_ENR_RESPONSE: u8 = 6;
 
 const PING_TIMEOUT: Duration = Duration::from_millis(500);
 const FIND_NODE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -166,6 +168,7 @@ pub struct Discovery<'a> {
 	id_hash: H256,
 	secret: Secret,
 	public_endpoint: NodeEndpoint,
+	node_record: enr::Enr,
 	discovery_initiated: bool,
 	discovery_round: Option<u16>,
 	discovery_id: NodeId,
@@ -191,12 +194,13 @@ pub struct TableUpdates {
 }
 
 impl<'a> Discovery<'a> {
-	pub fn new(key: &KeyPair, public: NodeEndpoint, ip_filter: IpFilter) -> Discovery<'static> {
+	pub fn new(key: &KeyPair, public: NodeEndpoint, node_record: enr::Enr, ip_filter: IpFilter) -> Discovery<'static> {
 		Discovery {
 			id: *key.public(),
 			id_hash: keccak(key.public()),
 			secret: key.secret().clone(),
 			public_endpoint: public,
+			node_record,
 			discovery_initiated: false,
 			discovery_round: None,
 			discovery_id: NodeId::default(),
@@ -388,6 +392,7 @@ impl<'a> Discovery<'a> {
 		self.public_endpoint.to_rlp_list(&mut rlp);
 		node.endpoint.to_rlp_list(&mut rlp);
 		append_expiration(&mut rlp);
+		rlp.append(&self.node_record.seq());
 		let old_parity_hash = keccak(rlp.as_raw());
 		let hash = self.send_packet(PACKET_PING, &node.endpoint.udp_address(), &rlp.drain())?;
 
@@ -502,6 +507,11 @@ impl<'a> Discovery<'a> {
 			PACKET_PONG => self.on_pong(&rlp, &node_id, &from),
 			PACKET_FIND_NODE => self.on_find_node(&rlp, &node_id, &from),
 			PACKET_NEIGHBOURS => self.on_neighbours(&rlp, &node_id, &from),
+			PACKET_ENR_REQUEST => self.on_enr_request(&rlp, &node_id, &from, hash_signed.as_bytes()),
+			PACKET_ENR_RESPONSE => {
+				debug!(target: "discovery", "ENR response handling is not implemented");
+				Ok(None)
+			}
 			_ => {
 				debug!(target: "discovery", "Unknown UDP packet: {}", packet_id);
 				Ok(None)
@@ -540,7 +550,8 @@ impl<'a> Discovery<'a> {
 		let ping_to = NodeEndpoint::from_rlp(&rlp.at(2)?)?;
 		let timestamp: u64 = rlp.val_at(3)?;
 		self.check_timestamp(timestamp)?;
-		let mut response = RlpStream::new_list(3);
+		let _enr_seq = rlp.val_at::<u64>(4).ok();
+		let mut response = RlpStream::new_list(4);
 		let pong_to = NodeEndpoint {
 			address: from.clone(),
 			udp_port: ping_from.udp_port
@@ -555,6 +566,7 @@ impl<'a> Discovery<'a> {
 
 		response.append(&echo_hash);
 		append_expiration(&mut response);
+		response.append(&self.node_record.seq());
 		self.send_packet(PACKET_PONG, from, &response.drain())?;
 
 		let entry = NodeEntry { id: *node_id, endpoint: pong_to.clone() };
@@ -574,6 +586,7 @@ impl<'a> Discovery<'a> {
 		let echo_hash: H256 = rlp.val_at(1)?;
 		let timestamp: u64 = rlp.val_at(2)?;
 		self.check_timestamp(timestamp)?;
+		let _enr_seq = rlp.val_at::<u64>(3).ok();
 
 		let expected_node = match self.in_flight_pings.entry(*node_id) {
 			Entry::Occupied(entry) => {
@@ -761,6 +774,18 @@ impl<'a> Discovery<'a> {
 			}
 			self.add_node(entry);
 		}
+		Ok(None)
+	}
+
+	fn on_enr_request(&mut self, rlp: &Rlp, _node_id: &NodeId, from: &SocketAddr, request_hash: &[u8]) -> Result<Option<TableUpdates>, Error> {
+		let _expiration = rlp.val_at::<u32>(0)?;
+
+		// TODO: check if recently pinged.
+
+		let mut response = RlpStream::new_list(2);
+		response.append(&request_hash);
+		response.append(&self.node_record);
+		self.send_packet(PACKET_ENR_RESPONSE, from, &response.drain())?;
 		Ok(None)
 	}
 
